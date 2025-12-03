@@ -1,0 +1,14 @@
+{
+    "SourceSiteUrl": "https://kalboussidev.sharepoint.com/sites/chamssite",
+    "TargetSiteUrl": "https://kalboussidev.sharepoint.com/sites/final2",
+    
+    "ApplicationId": "3b8a73d2-40d8-4038-a41a-62b4f0c60c80",
+    "TenantId": "8acda25e-a5e3-49ec-8ec1-125ebb299ffb",
+    
+    "CertificateThumbprint": "69FC9813ED16A694BADC656BF2951B62BFB48838",
+    
+    "ListsToMigrate": [
+        "VacationRequest"
+    ],
+    "IncludeFormTemplates": true
+}

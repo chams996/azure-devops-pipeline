@@ -1,0 +1,155 @@
+trigger:
+  branches:
+    include:
+    - main
+variables:
+- group: 'SharePointCreds'
+stages:
+- stage: __default
+  jobs:
+  - job: Job
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Install PnP.PowerShell'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          Install-Module -Name PnP.PowerShell -Force -AllowClobber -Scope CurrentUser
+          Import-Module PnP.PowerShell -Force
+          Write-Host " PnP.PowerShell installed"
+    - task: NuGetToolInstaller@1
+      displayName: 'Install NuGet'
+    - task: NuGetCommand@2
+      displayName: 'Install Power Platform CLI (PAC) via NuGet'
+      inputs:
+        command: 'custom'
+        arguments: 'install Microsoft.PowerApps.CLI -OutputDirectory pac'
+    - task: PowerShell@2
+      displayName: 'Set PAC CLI path'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          $pacNugetFolder = Get-ChildItem "$(Build.SourcesDirectory)\pac" | Where-Object { $_.Name -match "Microsoft.PowerApps.CLI." } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $pacPath = Join-Path $pacNugetFolder.FullName "tools\pac.exe"
+          Write-Host "PAC CLI path: $pacPath"
+          Write-Host "##vso[task.setvariable variable=pacPath]$pacPath"
+    - task: DownloadSecureFile@1
+      displayName: 'Download PFX Certificate'
+      name: DownloadPfx
+      inputs:
+        secureFile: 'DevopsPipelineAppExportable.pfx'
+    - task: PowerShell@2
+      displayName: 'Ensure export folder exists'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          $folder = "$(Build.ArtifactStagingDirectory)\PowerAppsExports"
+          if (!(Test-Path $folder)) { New-Item -ItemType Directory -Path $folder | Out-Null }
+          Write-Host "Folder ready: $folder"
+    - task: PowerShell@2
+      displayName: 'Run migration.ps1'
+      inputs:
+        targetType: 'filePath'
+        pwsh: true
+        filePath: 'migration.ps1'
+        arguments: >
+          -TenantId "$(TenantId)" -ClientId "$(ClientId)" -CertificatePath "$(DownloadPfx.secureFilePath)" -CertificatePassword "$(CertificatePassword)" -SitePairsFile "$(Build.SourcesDirectory)\sitepairs.json"
+    - task: PowerShell@2
+      displayName: 'Check powerapps.json'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          $jsonPath = "$(Build.SourcesDirectory)\powerapps.json"
+          if (-not (Test-Path $jsonPath)) { Write-Error " powerapps.json not found"; exit 1 }
+          Write-Host " powerapps.json found"
+    - task: PowerShell@2
+      displayName: 'Export Power Apps custom forms'
+      inputs:
+        targetType: 'filePath'
+        pwsh: true
+        filePath: 'export-customforms.ps1'
+        arguments: >
+          -SolutionsJson "$(Build.SourcesDirectory)\powerapps.json" -TenantId "$(TenantId)" -ClientId "$(ClientId)" -CertificatePath "$(DownloadPfx.secureFilePath)" -CertificatePassword "$(CertificatePassword)" -OutputFolder "$(Build.ArtifactStagingDirectory)\PowerAppsExports" -PacPath "$(pacPath)"
+    - task: PowerShell@2
+      displayName: 'Extract all exported solutions'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          $exportsRoot = "$(Build.ArtifactStagingDirectory)\PowerAppsExports"
+          $zipFiles = Get-ChildItem $exportsRoot -Filter *.zip
+          if (-not $zipFiles) { Write-Error " No solution zip files found"; exit 1 }
+          foreach ($zip in $zipFiles) {
+              $solutionName = [System.IO.Path]::GetFileNameWithoutExtension($zip.Name)
+              $extractPath = Join-Path $exportsRoot "${solutionName}_Extracted"
+              if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+              Expand-Archive -Path $zip.FullName -DestinationPath $extractPath -Force
+              Write-Host " Extracted $solutionName → $extractPath"
+          }
+    - task: PowerShell@2
+      displayName: "Generate Table Mapping"
+      inputs:
+        targetType: 'filePath'
+        filePath: '$(Build.SourcesDirectory)\Generate-Mapping.ps1'
+        arguments: >
+          -TenantId "$(TenantId)" -ClientId "$(ClientId)" -CertificatePath "$(DownloadPfx.secureFilePath)" -CertificatePassword "$(CertificatePassword)" -SitePairsFile "$(Build.SourcesDirectory)\sitepairs.json" -OutputFile "$(Build.SourcesDirectory)\tablemapping.json" -Lists @("VacationRequests","Employees","Projects")
+        pwsh: true
+    - task: PowerShell@2
+      displayName: 'Update DataSources and Canvas Apps'
+      inputs:
+        filePath: '$(Build.SourcesDirectory)\Update-DataSources.ps1'
+        arguments: >
+          -SolutionRoot "$(Build.ArtifactStagingDirectory)\PowerAppsExports" -SitePairsFile "$(Build.SourcesDirectory)\sitepairs.json" -TableNamesFile "$(Build.SourcesDirectory)\tablemapping.json"
+        pwsh: true
+    - task: PowerShell@2
+      displayName: 'Re-pack modified Canvas Apps (.msapp)'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: "$exportsRoot = \"$(Build.ArtifactStagingDirectory)\\PowerAppsExports\"\n$canvasFolders = Get-ChildItem -Path $exportsRoot -Recurse -Directory | Where-Object { $_.Name -eq \"CanvasApps\" }\nforeach ($folder in $canvasFolders) {\n    Get-ChildItem -Path $folder.FullName -Recurse -Directory | ForEach-Object {\n        if (Test-Path \"$($_.FullName)\\CanvasManifest.json\") {\n            $appName = Split-Path $_.FullName -Leaf\n            $msappOut = Join-Path $folder.FullName \"$appName.msapp\"\n            Write-Host \"\U0001F4E6 Packing $appName → $msappOut\"\n            & \"$(pacPath)\" canvas pack --sources \"$($_.FullName)\" --msapp \"$msappOut\"\n        }\n    }\n}\n"
+    - task: PowerShell@2
+      displayName: 'Repack Final Solutions'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          $exportsRoot = "$(Build.ArtifactStagingDirectory)\PowerAppsExports"
+          $extractedDirs = Get-ChildItem $exportsRoot -Directory | Where-Object { $_.Name -like "*_Extracted" }
+          foreach ($dir in $extractedDirs) {
+              $solutionName = $dir.Name -replace "_Extracted$",""
+              $finalZip = Join-Path $exportsRoot "${solutionName}_Final.zip"
+              if (Test-Path $finalZip) { Remove-Item $finalZip -Force }
+              Add-Type -AssemblyName 'System.IO.Compression.FileSystem'
+              [System.IO.Compression.ZipFile]::CreateFromDirectory($dir.FullName, $finalZip)
+              Write-Host " Final Solution re-packed: $finalZip"
+          }
+    - task: PowerShell@2
+      displayName: 'Move Final Solutions'
+      inputs:
+        targetType: 'inline'
+        pwsh: true
+        script: |
+          $src = "$(Build.ArtifactStagingDirectory)\PowerAppsExports"
+          $dest = "$(Build.ArtifactStagingDirectory)\Final-Solutions"
+          if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest | Out-Null }
+          Get-ChildItem $src -Filter "*_Final.zip" | ForEach-Object { Move-Item $_.FullName (Join-Path $dest $_.Name) -Force }
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Final Solutions'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)\Final-Solutions'
+        ArtifactName: 'Final-Solutions'
+        publishLocation: 'Container'
+    - task: PowerShell@2
+      displayName: 'Import Final Solutions'
+      inputs:
+        targetType: 'filePath'
+        pwsh: true
+        filePath: 'import-customforms.ps1'
+        arguments: >
+          -SolutionsJson "$(Build.SourcesDirectory)\powerapps-import.json" -TenantId "$(TenantId)" -ClientId "$(ClientId)" -CertificatePath "$(DownloadPfx.secureFilePath)" -CertificatePassword "$(CertificatePassword)" -PacPath "$(pacPath)" -SolutionsFolder "$(Build.ArtifactStagingDirectory)\Final-Solutions"
