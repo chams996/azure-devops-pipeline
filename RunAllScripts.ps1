@@ -3,7 +3,6 @@ param (
     [string]$Path, # Path where the script and subfolders are located
     [string]$SettingsFile = "param.json" # Use the unified automated settings file
 )
-# Created by Denis Molodtsov (@Zerg00s) in 2018 - Modified for 100% Certificate Automation
 
 $ErrorActionPreference = "Stop"
 
